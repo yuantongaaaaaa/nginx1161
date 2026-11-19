@@ -206,6 +206,12 @@ main(int argc, char *const *argv)
     ngx_conf_dump_t  *cd;
     ngx_core_conf_t  *ccf;
 
+    //yt add begin
+    printf("=== nginx 启动初始化开始，lmy-11111111进程PID: %d ===\n", getpid());
+    fflush(stdout); // 强制刷新缓冲区，确保立刻打印
+    //yt add end
+
+
     ngx_debug_init();
 
     if (ngx_strerror_init() != NGX_OK) {
