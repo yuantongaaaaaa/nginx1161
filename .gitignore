@@ -1,3 +1,11 @@
 /Makefile
-/objs/
-/tmp/
+/objs/*
+/tmp/*
+
+#ytadd
+# 忽略 IDEA 全部配置目录
+/.idea/*
+
+# 忽略 IDEA 模块描述文件
+/*.iml
+
