@@ -119,6 +119,8 @@ struct ngx_http_upstream_rr_peers_s {
     ngx_uint_t                      total_weight;
     ngx_uint_t                      tries;
 
+    ngx_int_t                       check_index;  /* active health checks */
+
     unsigned                        single:1;
     unsigned                        weighted:1;
 

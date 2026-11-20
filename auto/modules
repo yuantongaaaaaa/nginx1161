@@ -113,6 +113,22 @@ if [ $HTTP = YES ]; then
     fi
 
 
+    # the built-in active upstream health check module, it must be
+    # initialized after ngx_http_upstream_module, whose init_main_conf
+    # builds the round robin peers and registers the checked peers
+
+    if :; then
+        ngx_module_name=ngx_http_upstream_check_module
+        ngx_module_incs=
+        ngx_module_deps=src/http/ngx_http_upstream_check_module.h
+        ngx_module_srcs=src/http/ngx_http_upstream_check_module.c
+        ngx_module_libs=
+        ngx_module_link=YES
+
+        . auto/module
+    fi
+
+
     if [ $HTTP_CACHE = YES ]; then
         have=NGX_HTTP_CACHE . auto/have
         HTTP_SRCS="$HTTP_SRCS $HTTP_FILE_CACHE_SRCS"

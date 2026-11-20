@@ -9,6 +9,7 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <ngx_md5.h>
+#include <ngx_http_upstream_check_module.h>
 
 
 #define ngx_http_upstream_tries(p) ((p)->tries                                \
@@ -159,6 +160,7 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
         peers->total_weight = w;
         peers->tries = t;
         peers->name = &us->host;
+        peers->check_index = NGX_ERROR;
 
         n = 0;
         peerp = &peers->peer;
@@ -273,10 +275,18 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
             && !resolve
 #endif
         ) {
+            if (ngx_http_upstream_check_add_peers(cf, us, peers) != NGX_OK) {
+                return NGX_ERROR;
+            }
+
             return NGX_OK;
         }
 
         if (n + r == 0 && !(us->flags & NGX_HTTP_UPSTREAM_BACKUP)) {
+            if (ngx_http_upstream_check_add_peers(cf, us, peers) != NGX_OK) {
+                return NGX_ERROR;
+            }
+
             return NGX_OK;
         }
 
@@ -301,6 +311,7 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
         backup->total_weight = w;
         backup->tries = t;
         backup->name = &us->host;
+        backup->check_index = NGX_ERROR;
 
         n = 0;
         peerp = &backup->peer;
@@ -383,6 +394,10 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
 
         peers->next = backup;
 
+        if (ngx_http_upstream_check_add_peers(cf, us, peers) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
         return NGX_OK;
     }
 
@@ -429,6 +444,7 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
     peers->total_weight = n;
     peers->tries = n;
     peers->name = &us->host;
+    peers->check_index = NGX_ERROR;
 
     peerp = &peers->peer;
 
@@ -613,6 +629,7 @@ ngx_http_upstream_create_round_robin_peer(ngx_http_request_t *r,
     peers->number = ur->naddrs;
     peers->tries = ur->naddrs;
     peers->name = &ur->host;
+    peers->check_index = NGX_ERROR;
 
     if (ur->sockaddr) {
         peer[0].sockaddr = ur->sockaddr;
@@ -727,6 +744,10 @@ ngx_http_upstream_get_round_robin_peer(ngx_peer_connection_t *pc, void *data)
             peer = peers->peer;
 
             if (peer->down) {
+                goto failed;
+            }
+
+            if (ngx_http_upstream_check_peer_down(peers->check_index, 0)) {
                 goto failed;
             }
 
@@ -867,6 +888,10 @@ ngx_http_upstream_get_peer(ngx_http_upstream_rr_peer_data_t *rrp,
         }
 
         if (peer->down) {
+            continue;
+        }
+
+        if (ngx_http_upstream_check_peer_down(rrp->peers->check_index, i)) {
             continue;
         }
 
