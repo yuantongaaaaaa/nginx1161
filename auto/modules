@@ -129,6 +129,25 @@ if [ $HTTP = YES ]; then
     fi
 
 
+    # the built-in AJP module with SSL extension
+    # (ajp_pass / ajp_ssl / ajp_ssl_certificate / ...)
+    # Registered after ngx_http_upstream_module so that upstream SSL
+    # infrastructure is available when the AJP handler runs.
+
+    if :; then
+        ngx_module_name=ngx_http_ajp_module
+        ngx_module_incs=src/http/modules/ngx_http_ajp_module
+        ngx_module_deps="src/http/modules/ngx_http_ajp_module/ngx_http_ajp.h \
+                         src/http/modules/ngx_http_ajp_module/ngx_http_ajp_module.h"
+        ngx_module_srcs="src/http/modules/ngx_http_ajp_module/ngx_http_ajp_module.c \
+                         src/http/modules/ngx_http_ajp_module/ngx_http_ajp_handler.c"
+        ngx_module_libs=
+        ngx_module_link=YES
+
+        . auto/module
+    fi
+
+
     if [ $HTTP_CACHE = YES ]; then
         have=NGX_HTTP_CACHE . auto/have
         HTTP_SRCS="$HTTP_SRCS $HTTP_FILE_CACHE_SRCS"
