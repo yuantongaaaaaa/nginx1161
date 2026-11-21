@@ -34,7 +34,57 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#if (NGX_SSL_ASYNC)
+#include <openssl/async.h>
+#endif
+
 #define NGX_SSL_NAME     "OpenSSL"
+
+
+#if (NGX_SSL_ASYNC)
+
+/*
+ * Upper bound on how many eventfds OpenSSL may hand out to us for a single
+ * SSL object.  SSL_get_all_async_fds() reports every fd currently attached
+ * to the SSL's ASYNC_WAIT_CTX; in practice it is one fd per running
+ * ASYNC_JOB, and nginx drives one job at a time per connection, but we
+ * allocate a couple of slots to be safe against future OpenSSL behaviour.
+ */
+#define NGX_SSL_ASYNC_MAX_FDS  4
+
+typedef struct {
+    /* the real ngx_connection_t this async context belongs to */
+    ngx_connection_t           *connection;
+
+    /* OpenSSL ASYNC_WAIT_CTX eventfd bridged into nginx's event loop */
+    ngx_fd_t                    fd;
+
+    /*
+     * Fake ngx_connection_t + ngx_event_t wrapping fd, mimicking the
+     * pattern used by ngx_epoll_module for its notify/aio eventfds so
+     * that we can reuse the standard event module actions.  Allocated
+     * together with this struct via ngx_pcalloc(); we use pointers here
+     * because ngx_event_openssl.h is included from ngx_core.h before
+     * ngx_connection_t / ngx_event_t are fully declared.
+     */
+    ngx_connection_t           *async_conn;
+    ngx_event_t                *async_event;
+
+    /* saved handler to re-dispatch when the async task completes;
+     * typically ngx_ssl_handshake_handler / ngx_ssl_shutdown_handler /
+     * the read or write handler of the caller. */
+    ngx_event_handler_pt        async_handler;
+
+    /* flags */
+    unsigned                    enabled:1;   /* async path activated for this
+                                                SSL object */
+    unsigned                    fd_added:1;  /* fd currently registered in
+                                                epoll via ngx_event_actions */
+    unsigned                    closing:1;   /* connection is being torn down,
+                                                drop pending async callbacks */
+} ngx_ssl_async_t;
+
+#endif
 
 
 #if (defined LIBRESSL_VERSION_NUMBER && OPENSSL_VERSION_NUMBER == 0x20000000L)
@@ -126,6 +176,10 @@ struct ngx_ssl_connection_s {
     ngx_event_handler_pt        saved_write_handler;
 
     ngx_ssl_ocsp_t             *ocsp;
+
+#if (NGX_SSL_ASYNC)
+    ngx_ssl_async_t            *async;
+#endif
 
     u_char                      early_buf;
 
@@ -395,6 +449,35 @@ void ngx_ssl_connection_error(ngx_connection_t *c, int sslerr, ngx_err_t err,
 void ngx_cdecl ngx_ssl_error(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
     char *fmt, ...);
 void ngx_ssl_cleanup_ctx(void *data);
+
+
+#if (NGX_SSL_ASYNC)
+
+/*
+ * Bridge OpenSSL ASYNC_WAIT_CTX eventfds into nginx's event loop.
+ *
+ * Called when SSL_do_handshake / SSL_read / SSL_write / SSL_shutdown return
+ * SSL_ERROR_WANT_ASYNC.  Grabs every fd currently attached to the SSL
+ * object's wait context via SSL_get_changed_async_fds(), registers the first
+ * readable one with ngx_event_actions, and arranges for `handler` to be
+ * invoked on the wrapped eventfd when OpenSSL signals completion.
+ *
+ * Returns NGX_OK on success, NGX_ERROR if the fd could not be registered.
+ */
+ngx_int_t ngx_ssl_async_process_fds(ngx_connection_t *c,
+    ngx_event_handler_pt handler);
+
+/*
+ * Detach and release any epoll registration/state kept for the connection's
+ * async job.  Safe to call multiple times; safe to call when no async job
+ * is pending.  Does NOT close the eventfd itself (OpenSSL owns it and
+ * closes it via ASYNC_WAIT_CTX_free when the SSL object is freed), but does
+ * remove our epoll registration and clear the saved handler so no callback
+ * can fire after the ngx_connection_t is released.
+ */
+void ngx_ssl_async_cleanup(ngx_connection_t *c);
+
+#endif
 
 
 extern int  ngx_ssl_connection_index;

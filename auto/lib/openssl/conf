@@ -14,6 +14,10 @@ if [ $OPENSSL != NONE ]; then
         have=NGX_QUIC . auto/have
     fi
 
+    if [ $USE_OPENSSL_ASYNC = YES ]; then
+        have=NGX_SSL_ASYNC . auto/have
+    fi
+
     case "$CC" in
 
         cl | bcc32)
@@ -175,6 +179,30 @@ statically from the source with nginx by using --with-openssl=<path> option.
 
 END
                         exit 1
+                fi
+            fi
+
+            if [ $USE_OPENSSL_ASYNC = YES ]; then
+
+                ngx_feature="OpenSSL async job API"
+                ngx_feature_name="NGX_SSL_ASYNC"
+                ngx_feature_incs="#include <openssl/ssl.h>
+                                  #include <openssl/async.h>"
+                ngx_feature_test="OSSL_ASYNC_FD fds[4]; size_t na = 4, nd = 4;
+                                  (void) SSL_get_changed_async_fds(NULL, fds,
+                                                                   &na, fds,
+                                                                   &nd)"
+                . auto/feature
+
+                if [ $ngx_found = no ]; then
+cat << END
+
+$0: error: --with-openssl-async requires OpenSSL >= 1.1.0 with async job
+support (SSL_get_changed_async_fds, SSL_ERROR_WANT_ASYNC, ASYNC_WAIT_CTX).
+Please install a newer OpenSSL or drop the --with-openssl-async option.
+
+END
+                    exit 1
                 fi
             fi
         fi

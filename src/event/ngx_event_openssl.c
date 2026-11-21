@@ -58,6 +58,11 @@ static void ngx_ssl_read_handler(ngx_event_t *rev);
 static void ngx_ssl_shutdown_handler(ngx_event_t *ev);
 static void ngx_ssl_clear_error(ngx_log_t *log);
 
+#if (NGX_SSL_ASYNC)
+static void ngx_ssl_async_eventfd_handler(ngx_event_t *ev);
+static void ngx_ssl_async_pool_cleanup(void *data);
+#endif
+
 static ngx_int_t ngx_ssl_session_id_context(ngx_ssl_t *ssl,
     ngx_str_t *sess_ctx, ngx_array_t *certificates);
 static int ngx_ssl_new_session(ngx_ssl_conn_t *ssl_conn,
@@ -2152,6 +2157,52 @@ ngx_ssl_create_connection(ngx_ssl_t *ssl, ngx_connection_t *c, ngx_uint_t flags)
         return NGX_ERROR;
     }
 
+#if (NGX_SSL_ASYNC)
+    /*
+     * Attach a per-connection async bridge descriptor.  We deliberately do
+     * NOT allocate an ASYNC_WAIT_CTX here: OpenSSL creates one lazily on
+     * the first ASYNC_start_job() inside SSL_do_handshake / SSL_read /
+     * SSL_write.  Our job is only to observe the eventfd it exposes via
+     * SSL_get_changed_async_fds() and wire it into nginx's epoll.
+     */
+    sc->async = ngx_pcalloc(c->pool, sizeof(ngx_ssl_async_t));
+    if (sc->async == NULL) {
+        return NGX_ERROR;
+    }
+
+    sc->async->async_conn = ngx_pcalloc(c->pool, sizeof(ngx_connection_t));
+    if (sc->async->async_conn == NULL) {
+        return NGX_ERROR;
+    }
+
+    sc->async->async_event = ngx_pcalloc(c->pool, sizeof(ngx_event_t));
+    if (sc->async->async_event == NULL) {
+        return NGX_ERROR;
+    }
+
+    sc->async->connection = c;
+    sc->async->fd = (ngx_fd_t) -1;
+
+    /*
+     * Safety net: if the connection is torn down without going through
+     * ngx_ssl_shutdown() (e.g. error paths that call ngx_close_connection
+     * directly), the pool cleanup still runs before the memory backing
+     * the fake ngx_connection_t is released, so no stale epoll entry can
+     * fire against freed memory.
+     */
+    {
+        ngx_pool_cleanup_t  *cln;
+
+        cln = ngx_pool_cleanup_add(c->pool, 0);
+        if (cln == NULL) {
+            return NGX_ERROR;
+        }
+
+        cln->handler = ngx_ssl_async_pool_cleanup;
+        cln->data = sc->async;
+    }
+#endif
+
     c->ssl = sc;
 
     return NGX_OK;
@@ -2195,6 +2246,290 @@ ngx_ssl_set_session(ngx_connection_t *c, ngx_ssl_session_t *session)
 
     return NGX_OK;
 }
+
+
+#if (NGX_SSL_ASYNC)
+
+/*
+ * Called by nginx's event loop when OpenSSL's ASYNC_WAIT_CTX eventfd becomes
+ * readable, i.e. the async job finished (or wants us to make another
+ * SSL API call).  Responsibilities:
+ *
+ *   1. Drain the eventfd counter so we do not busy-loop.
+ *   2. Drop the fd from epoll (OpenSSL may hand us a different / no fd on
+ *      the next WANT_ASYNC round).
+ *   3. Re-dispatch the saved handler (typically ngx_ssl_handshake_handler or
+ *      ngx_ssl_shutdown_handler) on the *real* connection so the SSL
+ *      operation resumes.
+ *
+ * If the connection is already being torn down (closing flag) we skip
+ * dispatch entirely to avoid use-after-free.
+ */
+static void
+ngx_ssl_async_eventfd_handler(ngx_event_t *ev)
+{
+    ssize_t                n;
+    uint64_t               count;
+    ngx_fd_t               fd;
+    ngx_connection_t      *c;
+    ngx_connection_t      *fake_c;
+    ngx_ssl_async_t       *async;
+    ngx_event_handler_pt   handler;
+
+    /*
+     * epoll dispatches via c->read->handler(c->read), so ev->data is the
+     * fake ngx_connection_t we registered; async lives on fake_c->data.
+     */
+    fake_c = ev->data;
+    async = fake_c->data;
+    c = async->connection;
+    fd = async->fd;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "SSL async eventfd handler: fd:%d closing:%ui",
+                   fd, (ngx_uint_t) async->closing);
+
+    /* drain eventfd counter; ignoring EAGAIN is fine (already drained) */
+    if (fd != (ngx_fd_t) -1) {
+        n = read(fd, &count, sizeof(uint64_t));
+
+        if (n != sizeof(uint64_t)) {
+            ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, ngx_errno,
+                           "SSL async eventfd read() returned %z", n);
+        }
+    }
+
+    handler = async->async_handler;
+
+    /* remove our epoll registration: OpenSSL may attach a new fd next round */
+    ngx_ssl_async_cleanup(c);
+
+    if (async->closing) {
+        return;
+    }
+
+    if (handler == NULL) {
+        return;
+    }
+
+    /*
+     * Resume on the real connection's read event, matching how
+     * ngx_ssl_handshake_handler / ngx_ssl_shutdown_handler are wired.
+     * The saved handler is responsible for calling SSL_do_handshake /
+     * SSL_read / SSL_write / SSL_shutdown again; if OpenSSL parks again
+     * it will return WANT_ASYNC and re-enter ngx_ssl_async_process_fds().
+     */
+    handler(c->read);
+}
+/*
+ * Bridge OpenSSL's ASYNC_WAIT_CTX eventfds into nginx's epoll.
+ *
+ * OpenSSL 1.1.0+ runs long crypto primitives (RSA private-key ops, DH, ECDH,
+ * etc.) inside an ASYNC_JOB on its own thread pool when the engine supports
+ * it.  SSL_do_handshake / SSL_read / SSL_write return -1 with
+ * SSL_get_error() == SSL_ERROR_WANT_ASYNC to indicate the job has been
+ * parked.  Each parked job is bound to an ASYNC_WAIT_CTX which owns an
+ * eventfd; the async worker write()s that eventfd on completion.
+ *
+ * This function:
+ *   - calls SSL_get_changed_async_fds() to obtain the current fd(s),
+ *   - wraps the first fd in a fake ngx_connection_t + ngx_event_t,
+ *   - registers it with the active event module (epoll on Linux) as
+ *     readable, and
+ *   - remembers `handler` so it can be re-dispatched once the fd fires.
+ *
+ * Multiple WANT_ASYNC rounds (e.g. RSA + DH) are supported: after each
+ * completion the handler is invoked again, which drives another
+ * SSL_do_handshake / SSL_read / SSL_write that may park again on a fresh
+ * eventfd.
+ */
+ngx_int_t
+ngx_ssl_async_process_fds(ngx_connection_t *c, ngx_event_handler_pt handler)
+{
+    size_t              num_add, num_del;
+    OSSL_ASYNC_FD       add_fds[NGX_SSL_ASYNC_MAX_FDS];
+    OSSL_ASYNC_FD       del_fds[NGX_SSL_ASYNC_MAX_FDS];
+    OSSL_ASYNC_FD       fd;
+    ngx_ssl_async_t    *async;
+
+    if (c->ssl == NULL || c->ssl->async == NULL) {
+        return NGX_ERROR;
+    }
+
+    async = c->ssl->async;
+
+    /*
+     * If we already have a registered fd from a previous WANT_ASYNC that
+     * has not fired yet, drop it first.  OpenSSL will hand us the fresh
+     * set via SSL_get_changed_async_fds().
+     */
+    if (async->fd_added) {
+        ngx_ssl_async_cleanup(c);
+    }
+
+    num_add = NGX_SSL_ASYNC_MAX_FDS;
+    num_del = NGX_SSL_ASYNC_MAX_FDS;
+
+    ngx_ssl_clear_error(c->log);
+
+    if (SSL_get_changed_async_fds(c->ssl->connection, add_fds, &num_add,
+                                  del_fds, &num_del) != 1)
+    {
+        ngx_ssl_error(NGX_LOG_ALERT, c->log, 0,
+                      "SSL_get_changed_async_fds() failed");
+        return NGX_ERROR;
+    }
+
+    ngx_log_debug4(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "SSL async fds changed: add:%uz del:%uz add[0]:%d del[0]:%d",
+                   num_add, num_del,
+                   num_add ? (int) add_fds[0] : -1,
+                   num_del ? (int) del_fds[0] : -1);
+
+    if (num_add == 0) {
+        /*
+         * No new fd: either the async job already completed before we
+         * observed it, or OpenSSL is not actually parking.  Fall back to
+         * treating this as an immediate retry via a posted event.
+         */
+        async->async_handler = handler;
+        ngx_post_event(c->read, &ngx_posted_events);
+        return NGX_OK;
+    }
+
+    /* we only watch one fd; in practice OpenSSL attaches one per job */
+    fd = add_fds[0];
+
+    if (fd == (OSSL_ASYNC_FD) -1 || fd == (OSSL_ASYNC_FD) 0) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "SSL async fd is invalid: %d", (int) fd);
+        return NGX_ERROR;
+    }
+
+    async->fd = (ngx_fd_t) fd;
+    async->async_handler = handler;
+    async->enabled = 1;
+
+    /*
+     * Wire the fake connection so ngx_event_actions.add() can use it.
+     * nginx's epoll module reads c->fd off ev->data and stores the pointer
+     * in the epoll_event for later dispatch, so ev->data must stay pinned
+     * to async->async_conn for the lifetime of the registration.  We
+     * recover the async descriptor from async_conn->data inside the handler.
+     */
+    async->async_conn->fd = async->fd;
+    async->async_conn->read = async->async_event;
+    async->async_conn->log = c->log;
+    async->async_conn->data = async;
+
+    ngx_memzero(async->async_event, sizeof(ngx_event_t));
+
+    async->async_event->data = async->async_conn;
+    async->async_event->handler = ngx_ssl_async_eventfd_handler;
+    async->async_event->log = c->log;
+    async->async_event->active = 0;
+
+    if (ngx_add_event(async->async_event, NGX_READ_EVENT, 0) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, ngx_errno,
+                      "ngx_add_event() failed for SSL async fd:%d",
+                      (int) async->fd);
+        async->fd = (ngx_fd_t) -1;
+        async->async_handler = NULL;
+        return NGX_ERROR;
+    }
+
+    async->fd_added = 1;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "SSL async fd registered: %d handler:%p",
+                   (int) async->fd, handler);
+
+    return NGX_OK;
+}
+
+
+void
+ngx_ssl_async_cleanup(ngx_connection_t *c)
+{
+    ngx_ssl_async_t  *async;
+
+    if (c->ssl == NULL || c->ssl->async == NULL) {
+        return;
+    }
+
+    async = c->ssl->async;
+
+    if (async->fd_added) {
+
+        if (async->async_event->active) {
+            /*
+             * ngx_del_event expects ev->data to point at the connection
+             * whose fd is registered, matching how we added it.  That is
+             * already the case here (we never mutate it after add).
+             */
+            if (ngx_del_event(async->async_event, NGX_READ_EVENT, 0)
+                != NGX_OK)
+            {
+                ngx_log_error(NGX_LOG_ALERT, c->log, ngx_errno,
+                              "ngx_del_event() failed for SSL async fd:%d",
+                              (int) async->fd);
+            }
+        }
+
+        async->fd_added = 0;
+    }
+
+    if (async->async_event->posted) {
+        ngx_delete_posted_event(async->async_event);
+    }
+
+    async->async_handler = NULL;
+    async->fd = (ngx_fd_t) -1;
+
+    /*
+     * NOTE: we deliberately do NOT close() the eventfd.  OpenSSL created it
+     * inside ASYNC_WAIT_CTX and will close it when the SSL object is freed
+     * via SSL_free().  Our job was only to unregister it from nginx's epoll
+     * so no stale callback fires against a freed ngx_connection_t.
+     */
+}
+
+
+/*
+ * Pool cleanup handler: runs just before c->pool is destroyed.  If the
+ * connection was torn down without ngx_ssl_shutdown() being reached (or
+ * shutdown bailed out early on error), this is the last chance to remove
+ * the async eventfd from epoll so no callback fires against freed memory.
+ */
+static void
+ngx_ssl_async_pool_cleanup(void *data)
+{
+    ngx_ssl_async_t  *async = data;
+
+    if (async == NULL) {
+        return;
+    }
+
+    async->closing = 1;
+
+    if (async->fd_added) {
+
+        if (async->async_event->active) {
+            (void) ngx_del_event(async->async_event, NGX_READ_EVENT, 0);
+        }
+
+        async->fd_added = 0;
+    }
+
+    if (async->async_event->posted) {
+        ngx_delete_posted_event(async->async_event);
+    }
+
+    async->async_handler = NULL;
+    async->fd = (ngx_fd_t) -1;
+}
+
+#endif
 
 
 ngx_int_t
@@ -2316,6 +2651,33 @@ ngx_ssl_handshake(ngx_connection_t *c)
 
         return NGX_AGAIN;
     }
+
+#if (NGX_SSL_ASYNC)
+    if (sslerr == SSL_ERROR_WANT_ASYNC) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL_do_handshake: want async");
+
+        /*
+         * OpenSSL parked the crypto inside an ASYNC_JOB.  Register the
+         * eventfd it exposes so we get woken up when the job completes,
+         * and re-enter ngx_ssl_handshake_handler() at that point.  Both
+         * read and write handlers point at ngx_ssl_handshake_handler so
+         * that whichever side OpenSSL resumes on, the SSL_do_handshake()
+         * retry logic runs.
+         */
+        c->read->handler = ngx_ssl_handshake_handler;
+        c->write->handler = ngx_ssl_handshake_handler;
+
+        if (ngx_ssl_async_process_fds(c, ngx_ssl_handshake_handler)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+#endif
 
     err = (sslerr == SSL_ERROR_SYSCALL) ? ngx_errno : 0;
 
@@ -2474,6 +2836,25 @@ ngx_ssl_try_early_data(ngx_connection_t *c)
 
         return NGX_AGAIN;
     }
+
+#if (NGX_SSL_ASYNC)
+    if (sslerr == SSL_ERROR_WANT_ASYNC) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL_read_early_data: want async");
+
+        c->read->handler = ngx_ssl_handshake_handler;
+        c->write->handler = ngx_ssl_handshake_handler;
+
+        if (ngx_ssl_async_process_fds(c, ngx_ssl_handshake_handler)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+#endif
 
     err = (sslerr == SSL_ERROR_SYSCALL) ? ngx_errno : 0;
 
@@ -3001,6 +3382,28 @@ ngx_ssl_handle_recv(ngx_connection_t *c, int n)
         return NGX_AGAIN;
     }
 
+#if (NGX_SSL_ASYNC)
+    if (sslerr == SSL_ERROR_WANT_ASYNC) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL_read: want async");
+
+        c->read->ready = 0;
+
+        /*
+         * The read timer already covers this connection; when the async
+         * eventfd fires we simply re-enter c->read->handler which will
+         * call ngx_ssl_recv() -> SSL_read() again.  OpenSSL will resume
+         * the parked ASYNC_JOB via swapcontext.
+         */
+        if (ngx_ssl_async_process_fds(c, c->read->handler) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+#endif
+
     if (sslerr == SSL_ERROR_SYSCALL && ERR_peek_error() == 0 && err == 0) {
 
         /*
@@ -3343,6 +3746,27 @@ ngx_ssl_write(ngx_connection_t *c, u_char *data, size_t size)
         return NGX_AGAIN;
     }
 
+#if (NGX_SSL_ASYNC)
+    if (sslerr == SSL_ERROR_WANT_ASYNC) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL_write: want async");
+
+        c->write->ready = 0;
+
+        /*
+         * The write timer already covers this connection.  When the async
+         * eventfd fires we re-enter c->write->handler which will retry
+         * SSL_write(); OpenSSL resumes the parked ASYNC_JOB internally.
+         */
+        if (ngx_ssl_async_process_fds(c, c->write->handler) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+#endif
+
     c->ssl->no_wait_shutdown = 1;
     c->ssl->no_send_shutdown = 1;
     c->write->error = 1;
@@ -3457,6 +3881,22 @@ ngx_ssl_write_early(ngx_connection_t *c, u_char *data, size_t size)
 
         return NGX_AGAIN;
     }
+
+#if (NGX_SSL_ASYNC)
+    if (sslerr == SSL_ERROR_WANT_ASYNC) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL_write_early_data: want async");
+
+        c->write->ready = 0;
+
+        if (ngx_ssl_async_process_fds(c, c->write->handler) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+#endif
 
     c->ssl->no_wait_shutdown = 1;
     c->ssl->no_send_shutdown = 1;
@@ -3638,6 +4078,22 @@ ngx_ssl_sendfile(ngx_connection_t *c, ngx_buf_t *file, size_t size)
         return NGX_AGAIN;
     }
 
+#if (NGX_SSL_ASYNC)
+    if (sslerr == SSL_ERROR_WANT_ASYNC) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "SSL_sendfile: want async");
+
+        c->write->ready = 0;
+
+        if (ngx_ssl_async_process_fds(c, c->write->handler) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+#endif
+
     c->ssl->no_wait_shutdown = 1;
     c->ssl->no_send_shutdown = 1;
     c->write->error = 1;
@@ -3783,6 +4239,30 @@ ngx_ssl_shutdown(ngx_connection_t *c)
             return NGX_AGAIN;
         }
 
+#if (NGX_SSL_ASYNC)
+        if (sslerr == SSL_ERROR_WANT_ASYNC) {
+
+            ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                           "SSL_shutdown: want async");
+
+            c->read->handler = ngx_ssl_shutdown_handler;
+            c->write->handler = ngx_ssl_shutdown_handler;
+
+            /*
+             * The 3s shutdown timer already covers us; when the async
+             * eventfd fires we re-enter ngx_ssl_shutdown_handler which
+             * will retry SSL_shutdown().
+             */
+            if (ngx_ssl_async_process_fds(c, ngx_ssl_shutdown_handler)
+                != NGX_OK)
+            {
+                goto failed;
+            }
+
+            return NGX_AGAIN;
+        }
+#endif
+
         err = (sslerr == SSL_ERROR_SYSCALL) ? ngx_errno : 0;
 
         if (sslerr == SSL_ERROR_SYSCALL && ERR_peek_error() == 0 && err == 0) {
@@ -3810,6 +4290,21 @@ failed:
     rc = NGX_ERROR;
 
 done:
+
+#if (NGX_SSL_ASYNC)
+    /*
+     * Detach our epoll registration before SSL_free() destroys the
+     * ASYNC_WAIT_CTX (and closes the eventfd).  Doing this here covers
+     * every shutdown path: clean shutdown, error, timeout, and handshake
+     * abort.  Marking `closing` guards against a race where the fd fires
+     * between ngx_del_event() and pool destruction.
+     */
+    if (c->ssl->async) {
+        c->ssl->async->closing = 1;
+    }
+
+    ngx_ssl_async_cleanup(c);
+#endif
 
 #if (defined BIO_get_ktls_recv && NGX_LINUX)
 

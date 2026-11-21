@@ -28,6 +28,10 @@ case $OPENSSL in
     *)     echo "  + using OpenSSL library: $OPENSSL" ;;
 esac
 
+if [ $USE_OPENSSL_ASYNC = YES ]; then
+    echo "  + using OpenSSL async job support"
+fi
+
 case $ZLIB in
     YES)   echo "  + using system zlib library" ;;
     NONE)  echo "  + zlib library is not used" ;;
