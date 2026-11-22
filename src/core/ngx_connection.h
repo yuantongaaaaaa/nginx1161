@@ -158,6 +158,11 @@ struct ngx_connection_s {
     ngx_ssl_connection_t  *ssl;
 #endif
 
+#if (NGX_SSL && NGX_SSL_ASYNC)
+    ngx_event_t           *async;
+    ngx_socket_t           async_fd;
+#endif
+
     ngx_udp_connection_t  *udp;
 
     struct sockaddr    *local_sockaddr;

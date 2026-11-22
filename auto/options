@@ -162,6 +162,7 @@ PCRE2=YES
 USE_OPENSSL=NO
 USE_OPENSSL_QUIC=NO
 USE_OPENSSL_ASYNC=NO
+USE_IOURING=NO
 OPENSSL=NONE
 
 USE_ZLIB=NO
@@ -395,6 +396,7 @@ use the \"--with-mail_ssl_module\" option instead"
         --with-openssl=*)                OPENSSL="$value"           ;;
         --with-openssl-opt=*)            OPENSSL_OPT="$value"       ;;
         --with-openssl-async)            USE_OPENSSL_ASYNC=YES      ;;
+        --with-iouring)                  USE_IOURING=YES             ;;
 
         --with-md5=*)
             NGX_POST_CONF_MSG="$NGX_POST_CONF_MSG
@@ -637,6 +639,9 @@ cat << END
   --with-openssl-opt=OPTIONS         set additional build options for OpenSSL
   --with-openssl-async               enable OpenSSL async job support
                                      (requires OpenSSL >= 1.1.0)
+
+  --with-iouring                     enable io_uring event notification
+                                     (requires liburing >= 2.x, Linux only)
 
   --with-debug                       enable debug logging
 
