@@ -132,7 +132,9 @@ EPOLL_MODULE=ngx_epoll_module
 EPOLL_SRCS=src/event/modules/ngx_epoll_module.c
 
 IOURING_MODULE=ngx_iouring_module
-IOURING_SRCS=src/event/modules/ngx_iouring_module.c
+IOURING_SRCS="src/event/modules/ngx_iouring_module.c
+              src/event/modules/ngx_iouring_io.c"
+IOURING_DEPS=src/event/modules/ngx_iouring_module.h
 
 FILE_AIO_SRCS="src/os/unix/ngx_file_aio_read.c"
 LINUX_AIO_SRCS="src/os/unix/ngx_linux_aio_read.c"

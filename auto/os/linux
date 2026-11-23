@@ -132,6 +132,7 @@ if [ $USE_IOURING = YES ]; then
     if [ $ngx_found = yes ]; then
         have=NGX_HAVE_IOURING . auto/have
         CORE_SRCS="$CORE_SRCS $IOURING_SRCS"
+        CORE_DEPS="$CORE_DEPS $IOURING_DEPS"
         EVENT_MODULES="$EVENT_MODULES $IOURING_MODULE"
         CORE_LIBS="$CORE_LIBS -luring"
 

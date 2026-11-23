@@ -16,6 +16,11 @@
 #define NGX_INVALID_INDEX  0xd0d0d0d0
 
 
+#if (NGX_HAVE_IOURING)
+typedef struct ngx_iouring_io_s  ngx_iouring_io_t;
+#endif
+
+
 struct ngx_event_s {
     void            *data;
 
@@ -98,6 +103,16 @@ struct ngx_event_s {
 
     /* the posted queue */
     ngx_queue_t      queue;
+
+#if (NGX_HAVE_IOURING)
+    /*
+     * io_uring pure-async I/O context bound to this event.
+     * NULL when the event is driven by POLL_ADD only (Phase 1),
+     * non-NULL while a RECV/READV/SEND/WRITEV SQE is in flight
+     * or its CQE result is waiting to be consumed (Phase 2).
+     */
+    ngx_iouring_io_t  *iouring_io;
+#endif
 
 #if 0
 
